@@ -5,6 +5,8 @@ import os
 import re
 import json
 import time
+import shutil
+import tempfile
 import subprocess
 import requests
 from seleniumbase import SB
@@ -39,13 +41,13 @@ def parse_accounts() -> list[tuple[str, str]]:
     """
     智能解析多账号配置，支持以下多种格式：
     1. KATABUMP_ACCOUNTS: 
-       - JSON 格式: [{"email":"a@b.com","password":"pwd"}, ...] 或 ["a@b.com:pwd", ...]
-       - 文本多行/分隔符: "a@b.com:pwd\nc@d.com:pwd2" 或 "a@b.com----pwd"
+       - 组合格式: "a@b.com:pwd\nc@d.com:pwd2" 或 "a@b.com:pwd,c@d.com:pwd2"
+       - JSON 格式: [{"email":"a@b.com","password":"pwd"}, ...]
     2. KATABUMP_EMAIL & KATABUMP_PASSWORD:
+       - 组合格式填入 KATABUMP_EMAIL: "a@b.com:pwd\nc@d.com:pwd2" 或逗号/分号分隔
        - 换行分隔: EMAIL="a@b.com\nc@d.com", PASSWORD="pwd1\npwd2"
-       - 逗号/分号/&分隔: EMAIL="a@b.com,c@d.com", PASSWORD="pwd1,pwd2"
+       - 逗号/分号/冒号分隔: EMAIL="a@b.com:c@d.com", PASSWORD="pwd1:pwd2"
        - 单密码多账号: EMAIL="a@b.com,c@d.com", PASSWORD="pwd" (共用同一密码)
-       - 组合填入 KATABUMP_EMAIL: "a@b.com:pwd\nc@d.com:pwd2"
        - 单账号 (向前兼容): EMAIL="a@b.com", PASSWORD="pwd"
     3. 编号环境变量:
        - KATABUMP_EMAIL_1, KATABUMP_PASSWORD_1, KATABUMP_EMAIL_2...
@@ -60,100 +62,105 @@ def parse_accounts() -> list[tuple[str, str]]:
             seen.add(u)
             accounts.append((u, p))
 
-    # 1. 解析 KATABUMP_ACCOUNTS 环境变量
-    raw_accounts = os.environ.get("KATABUMP_ACCOUNTS", "").strip()
-    if raw_accounts:
-        # 尝试 JSON 格式
-        if (raw_accounts.startswith("[") and raw_accounts.endswith("]")) or \
-           (raw_accounts.startswith("{") and raw_accounts.endswith("}")):
+    def parse_text_tokens(text: str) -> list[tuple[str, str]]:
+        if not text:
+            return []
+        
+        trimmed = text.strip()
+        # 1. 尝试 JSON 格式
+        if (trimmed.startswith("[") and trimmed.endswith("]")) or (trimmed.startswith("{") and trimmed.endswith("}")):
             try:
-                data = json.loads(raw_accounts)
+                data = json.loads(trimmed)
+                res = []
                 if isinstance(data, list):
                     for item in data:
                         if isinstance(item, dict):
                             e = item.get("email") or item.get("user") or item.get("username") or ""
                             p = item.get("password") or item.get("pass") or item.get("pwd") or ""
-                            if e and p:
-                                add_account(str(e), str(p))
+                            if e and p: res.append((str(e).strip(), str(p).strip()))
                         elif isinstance(item, str) and ":" in item:
                             parts = item.split(":", 1)
-                            add_account(parts[0], parts[1])
+                            res.append((parts[0].strip(), parts[1].strip()))
                 elif isinstance(data, dict):
                     e = data.get("email") or data.get("user") or data.get("username") or ""
                     p = data.get("password") or data.get("pass") or data.get("pwd") or ""
-                    if e and p:
-                        add_account(str(e), str(p))
+                    if e and p: res.append((str(e).strip(), str(p).strip()))
+                if res:
+                    return res
             except Exception:
                 pass
-        
-        # 尝试文本行格式
-        if not accounts:
-            lines = re.split(r'[\r\n]+', raw_accounts)
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                for sep in ["----", "---", "--", ":", "#", ","]:
-                    if sep in line:
-                        parts = line.split(sep, 1)
-                        u, p = parts[0].strip(), parts[1].strip()
-                        if u and p and ('@' in u or sep != ','):
-                            add_account(u, p)
-                            break
+
+        # 2. 文本解析：先按换行切分，再按逗号、分号或空格切分
+        lines = re.split(r'[\r\n]+', text)
+        tokens = []
+        for l in lines:
+            l = l.strip()
+            if not l or l.startswith("#"):
+                continue
+            if "," in l:
+                tokens.extend([x.strip() for x in l.split(",") if x.strip()])
+            elif ";" in l:
+                tokens.extend([x.strip() for x in l.split(";") if x.strip()])
+            elif " " in l and "@" in l and ":" in l:
+                tokens.extend([x.strip() for x in l.split() if x.strip()])
+            else:
+                tokens.append(l)
+
+        res = []
+        for t in tokens:
+            for sep in ["----", "---", "--", ":", "#"]:
+                if sep in t:
+                    parts = t.split(sep, 1)
+                    left, right = parts[0].strip(), parts[1].strip()
+                    # left 必须包含 @，且 right 不能包含 @（排除 user1@g.com:user2@g.com 的情况）
+                    if left and right and "@" in left and "@" not in right:
+                        res.append((left, right))
+                        break
+        return res
+
+    # 1. 解析 KATABUMP_ACCOUNTS 环境变量
+    raw_accounts = os.environ.get("KATABUMP_ACCOUNTS", "").strip()
+    if raw_accounts:
+        for u, p in parse_text_tokens(raw_accounts):
+            add_account(u, p)
 
     # 2. 解析 KATABUMP_EMAIL 和 KATABUMP_PASSWORD
     raw_email = os.environ.get("KATABUMP_EMAIL", "").strip()
     raw_pwd = os.environ.get("KATABUMP_PASSWORD", "").strip()
 
     if raw_email:
-        combined_lines = [l.strip() for l in re.split(r'[\r\n]+', raw_email) if l.strip()]
-        temp_combined = []
-        for line in combined_lines:
-            for sep in ["----", "---", "--", ":", "#"]:
-                if sep in line:
-                    parts = line.split(sep, 1)
-                    u, p = parts[0].strip(), parts[1].strip()
-                    if u and p and '@' in u:
-                        temp_combined.append((u, p))
-                        break
-        
-        if temp_combined and len(temp_combined) == len(combined_lines):
-            for u, p in temp_combined:
+        combined = parse_text_tokens(raw_email)
+        if combined:
+            for u, p in combined:
                 add_account(u, p)
         else:
-            # 辅助拆分函数
-            def split_items(text: str) -> list[str]:
-                if not text:
-                    return []
-                if '\n' in text or '\r' in text:
-                    return [x.strip() for x in re.split(r'[\r\n]+', text) if x.strip()]
-                elif ';' in text:
-                    return [x.strip() for x in text.split(';') if x.strip()]
-                elif '&' in text:
-                    return [x.strip() for x in text.split('&') if x.strip()]
-                elif ',' in text:
-                    return [x.strip() for x in text.split(',') if x.strip()]
-                else:
-                    return [text.strip()]
-
-            emails = split_items(raw_email)
-            # 如果是单邮箱，直接使用整个 raw_pwd（避免密码中含逗号等字符被误拆）
-            if len(emails) == 1:
-                passwords = [raw_pwd] if raw_pwd else []
+            # 判断分隔符：换行、分号、逗号或冒号
+            if "\n" in raw_email or "\r" in raw_email:
+                emails = [x.strip() for x in re.split(r'[\r\n]+', raw_email) if x.strip()]
+                passwords = [x.strip() for x in re.split(r'[\r\n]+', raw_pwd) if x.strip()]
+            elif ";" in raw_email:
+                emails = [x.strip() for x in raw_email.split(";") if x.strip()]
+                passwords = [x.strip() for x in raw_pwd.split(";") if x.strip()]
+            elif "," in raw_email:
+                emails = [x.strip() for x in raw_email.split(",") if x.strip()]
+                passwords = [x.strip() for x in raw_pwd.split(",") if x.strip()]
+            elif ":" in raw_email:
+                emails = [x.strip() for x in raw_email.split(":") if x.strip()]
+                passwords = [x.strip() for x in raw_pwd.split(":") if x.strip()]
             else:
-                passwords = split_items(raw_pwd)
+                emails = [raw_email.strip()]
+                passwords = [raw_pwd.strip()] if raw_pwd else []
 
-            if len(emails) == 1 and len(passwords) == 1:
-                add_account(emails[0], passwords[0])
-            elif len(emails) > 0 and len(emails) == len(passwords):
+            if len(emails) == len(passwords) and len(emails) > 0:
                 for e, p in zip(emails, passwords):
                     add_account(e, p)
             elif len(emails) > 0 and len(passwords) == 1:
-                # 多邮箱共用同一个密码
                 for e in emails:
                     add_account(e, passwords[0])
-            elif len(emails) > 0 and len(passwords) == 0:
-                print("⚠️ 检测到 KATABUMP_EMAIL，但未配置对应的 KATABUMP_PASSWORD")
+            elif len(emails) > 0 and len(passwords) > 1:
+                for idx, e in enumerate(emails):
+                    if idx < len(passwords):
+                        add_account(e, passwords[idx])
 
     # 3. 解析编号环境变量 KATABUMP_EMAIL_1, KATABUMP_PASSWORD_1, KATABUMP_EMAIL_2...
     numbered_accs = {}
@@ -187,7 +194,6 @@ def send_tg_message(status_icon: str, status_text: str, detail: str = "", email:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
 
-    # 获取北京时间 (UTC+8)
     local_time = time.gmtime(time.time() + 8 * 3600)
     current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     masked_email = mask_email(email) if email else "未知账户"
@@ -313,63 +319,6 @@ _SOLVED_JS = """
 })()
 """
 
-_WININFO_JS = """
-(function(){
-    return {
-        sx: window.screenX || 0,
-        sy: window.screenY || 0,
-        oh: window.outerHeight,
-        ih: window.innerHeight
-    };
-})()
-"""
-
-_ALTCHA_EXPAND_JS = """
-(function() {
-    var modal = document.querySelector('div.modal.show') || document;
-    var iframes = modal.querySelectorAll('iframe');
-    for (var i = 0; i < iframes.length; i++) {
-        var r = iframes[i].getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) {
-            iframes[i].style.width  = '300px';
-            iframes[i].style.height = '150px';
-            iframes[i].style.minWidth  = '300px';
-            iframes[i].style.minHeight = '150px';
-            iframes[i].style.visibility = 'visible';
-            iframes[i].style.opacity = '1';
-            var el = iframes[i];
-            for (var j = 0; j < 10; j++) {
-                el = el.parentElement;
-                if (!el) break;
-                el.style.overflow = 'visible';
-            }
-            var r2 = iframes[i].getBoundingClientRect();
-            return { cx: Math.round(r2.x + 30), cy: Math.round(r2.y + r2.height / 2) };
-        }
-    }
-    return null;
-})()
-"""
-
-_ALTCHA_SOLVED_JS = """
-(function(){
-    var modal = document.querySelector('div.modal.show') || document;
-    var inputs = modal.querySelectorAll('input[type="hidden"]');
-    for (var i = 0; i < inputs.length; i++) {
-        var n = (inputs[i].name || '').toLowerCase();
-        if ((n.includes('altcha') || n.includes('captcha')) &&
-            inputs[i].value && inputs[i].value.length > 20) return true;
-    }
-    var cbs = modal.querySelectorAll('input[type="checkbox"]');
-    for (var j = 0; j < cbs.length; j++) {
-        if (cbs[j].disabled) return true;
-    }
-    var w = modal.querySelector('[data-state="verified"],.altcha--verified,.altcha-verified');
-    if (w) return true;
-    return false;
-})()
-"""
-
 
 # ===== 浏览器操作工具 =====
 
@@ -410,7 +359,7 @@ def handle_turnstile(sb) -> bool:
             pass
         time.sleep(0.5)
 
-    for attempt in range(6):
+    for attempt in range(8):
         if sb.execute_script(_SOLVED_JS):
             print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
             return True
@@ -430,7 +379,7 @@ def handle_turnstile(sb) -> bool:
 
         print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
 
-    print("  ❌ Turnstile 6 次均失败")
+    print("  ❌ Turnstile 8 次均失败")
     return False
 
 
@@ -441,20 +390,38 @@ def login(sb, email: str, password: str) -> bool:
     masked = mask_email(email)
     print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
     sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
-    time.sleep(8)
+    time.sleep(6)
+
+    # 检查是否由于已登录而被重定向到仪表盘
+    cur_url = sb.get_current_url().lower()
+    page_title = sb.get_title() or ""
+    if "/dashboard" in cur_url or "dashboard | katabump" in page_title.lower() or "/servers" in cur_url:
+        print("ℹ️ 检测到已处于登录状态，执行登出以切换新账号...")
+        try:
+            sb.open(f"{BASE_URL}/auth/logout")
+            time.sleep(3)
+        except Exception:
+            pass
+        try:
+            sb.delete_all_cookies()
+            sb.execute_script("try{window.localStorage.clear(); window.sessionStorage.clear();}catch(e){}")
+        except Exception:
+            pass
+        sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
+        time.sleep(6)
 
     # 先等待 Cloudflare 验证通过（最多等 30 秒）
     print("⏳ 等待 Cloudflare 验证通过...")
     cf_passed = False
     for i in range(30):
         page_src = sb.get_page_source() or ""
-        if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
+        if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower() or 'type="email"' in page_src.lower():
             cf_passed = True
             print(f"✅ Cloudflare 验证已通过（{i+1}s）")
             break
         time.sleep(1)
     if not cf_passed:
-        print("⚠️ Cloudflare 验证可能未通过，继续尝试...")
+        print("⚠️ Cloudflare 验证可能未通过，继续尝试查找输入框...")
 
     try:
         sb.wait_for_element('input[type="email"]', timeout=15)
@@ -463,21 +430,24 @@ def login(sb, email: str, password: str) -> bool:
         try:
             sb.wait_for_element('input[type="Email"]', timeout=5)
         except Exception:
-            print("❌ 页面未加载出登录表单")
-            cur_url = sb.get_current_url()
-            page_title = sb.get_title() or ""
-            print(f"  当前 URL: {cur_url}")
-            print(f"  当前标题: {page_title}")
             try:
-                sb.save_screenshot(f"login_load_fail_{masked}.png")
+                sb.wait_for_element('input[name="email"]', timeout=5)
             except Exception:
-                pass
-            return False
+                print("❌ 页面未加载出登录表单")
+                cur_url = sb.get_current_url()
+                page_title = sb.get_title() or ""
+                print(f"  当前 URL: {cur_url}")
+                print(f"  当前标题: {page_title}")
+                try:
+                    sb.save_screenshot(f"login_load_fail_{masked}.png")
+                except Exception:
+                    pass
+                return False
 
     print("🍪 关闭可能的 Cookie 弹窗...")
     try:
         for btn in sb.find_elements("button"):
-            if "Accept" in (btn.text or ""):
+            if "Accept" in (btn.text or "") or "同意" in (btn.text or ""):
                 btn.click()
                 time.sleep(0.5)
                 break
@@ -513,14 +483,25 @@ def login(sb, email: str, password: str) -> bool:
     else:
         print("ℹ️ 未检测到 Turnstile")
 
-    print("🖱️ 敲击回车提交表单...")
+    print("🖱️ 提交登录表单...")
+    submitted = False
     try:
-        sb.press_keys('input[name="password"]', '\n')
+        submit_btn = sb.find_element('button[type="submit"]', timeout=3)
+        submit_btn.click()
+        submitted = True
+        print("✅ 点击登录按钮提交")
     except Exception:
+        pass
+
+    if not submitted:
         try:
-            sb.press_keys('input[type="password"]', '\n')
+            sb.press_keys('input[name="password"]', '\n')
+            print("✅ 敲击回车提交")
         except Exception:
-            pass
+            try:
+                sb.press_keys('input[type="password"]', '\n')
+            except Exception:
+                pass
 
     print("⏳ 等待登录跳转...")
     for _ in range(15):
@@ -560,14 +541,12 @@ def _goto_server_detail(sb, email: str = "") -> bool:
     print("\n🖥️  正在进入服务器续期页...")
     time.sleep(5)
 
-    # 检查页面顶部是否已有"还无法续期"全局提示
     alert_text = _read_alert(sb)
     if alert_text and "can't renew" in alert_text.lower():
         print(f"ℹ️  页面顶部提示: {alert_text}")
         send_tg_message("⏳", "未到续期时间", alert_text, email=email)
         return False
 
-    # 多种选择器尝试查找 See 链接
     selectors = [
         'a[href*="/servers/edit?id="]',
         'td a[href*="/servers/edit"]',
@@ -584,7 +563,6 @@ def _goto_server_detail(sb, email: str = "") -> bool:
         except Exception:
             continue
 
-    # 选择器未命中，尝试文本匹配
     if see_link is None:
         print("⚠️ 选择器未命中，尝试文本匹配...")
         try:
@@ -772,7 +750,6 @@ def renew_server(sb, email: str) -> tuple[str, str]:
         status, detail = _process_single_server(sb, email)
         results.append((status, detail))
 
-    # 汇总当前账号状态
     if any(r[0] == "success" for r in results):
         return "success", "; ".join([r[1] for r in results if r[1]])
     elif any(r[0] == "not_time" for r in results):
@@ -783,14 +760,19 @@ def renew_server(sb, email: str) -> tuple[str, str]:
 
 
 def process_single_account(idx: int, total: int, email: str, password: str, sb_kwargs: dict) -> tuple[str, str]:
-    """处理单个账号的独立浏览器会话，保证各账号间环境彻底隔离"""
+    """处理单个账号的独立浏览器会话，每个账号拥有完全独立的临时数据目录，彻底杜绝数据残留"""
     masked = mask_email(email)
     print("\n" + "=" * 55)
     print(f"▶ [{idx}/{total}] 正在处理账号: {masked}")
     print("=" * 55)
 
+    # 为每个账号创建完全隔离的临时 profile 目录
+    temp_profile_dir = tempfile.mkdtemp(prefix=f"sb_profile_{idx}_")
+    account_sb_kwargs = dict(sb_kwargs)
+    account_sb_kwargs["user_data_dir"] = temp_profile_dir
+
     try:
-        with SB(**sb_kwargs) as sb:
+        with SB(**account_sb_kwargs) as sb:
             # 仅在第一个账号时探测出口 IP
             if idx == 1:
                 try:
@@ -811,6 +793,12 @@ def process_single_account(idx: int, total: int, email: str, password: str, sb_k
         print(f"\n⚠️ [{masked}] 处理过程中发生异常: {err_msg}")
         send_tg_message("⚠️", "运行异常", err_msg, email=email)
         return "exception", err_msg
+    finally:
+        # 清理临时数据目录
+        try:
+            shutil.rmtree(temp_profile_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 # ===== 主执行入口 =====
