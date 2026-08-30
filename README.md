@@ -13,7 +13,7 @@
 | `KATABUMP_EMAIL` | ✅ 必填 | katabump 登录邮箱（支持单账号或多账号） |
 | `KATABUMP_PASSWORD` | ✅ 必填 | katabump 登录密码（支持单密码或多密码） |
 | `KATABUMP_ACCOUNTS` | ❌ 可选 | 账号密码组合列表（可选，填入后优先使用） |
-| `NODE_LINK` | ❌ 可选 | 代理链接，如 `vless://` `vmess://` `tuic://` `hysteria2://` `socks5://` 等 |
+| `NODE_LINK` | ❌ 可选 | 代理链接（支持填入单行或多行换行填入多个备用节点） |
 | `TG_BOT_TOKEN` | ❌ 可选 | Telegram Bot Token（用于推送续期结果） |
 | `TG_CHAT_ID` | ❌ 可选 | Telegram Chat ID（接收通知的用户或群组 ID） |
 
@@ -60,8 +60,15 @@ account2@gmail.com:password456
 
 ### 🌐 代理格式（确认在 v2rayN / Clash 里使用正常的节点）
 
-`NODE_LINK` 支持以下任意一种代理协议的完整分享链接（不配置则直连）：
+`NODE_LINK` 支持按行填入一个或**多个备用节点**（支持换行分隔，脚本会自动按顺序尝试，直到连接成功）：
 
+```text
+vless://uuid1@server1:port?security=reality&sni=...
+hysteria2://auth@server2:port?sni=...
+socks5://user:pass@server3:port
+```
+
+支持以下任意一种代理协议的完整分享链接（不配置则直连）：
 - **VLESS**：`vless://uuid@server:port?security=reality&sni=...&type=ws&...`
 - **VMess**：`vmess://base64encoded...`
 - **Trojan**：`trojan://password@server:port?sni=...&type=ws&...`

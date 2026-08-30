@@ -31,7 +31,27 @@ jobs:
       env:
         NODE_LINK: ${{ secrets.NODE_LINK }}
       run: |
-        bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+        if [ -n "$NODE_LINK" ]; then
+          wget -qO setup_proxy.sh https://main.ssss.nyc.mn/setup_proxy.sh
+          chmod +x setup_proxy.sh
+          while IFS= read -r node; do
+            node=$(echo "$node" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -z "$node" ] && continue
+            [[ "$node" =~ ^# ]] && continue
+            echo "=========================================="
+            echo "🔄 尝试连接节点: $(echo "$node" | cut -d':' -f1) ..."
+            if NODE_LINK="$node" bash setup_proxy.sh; then
+              echo "✅ 代理节点启动并测试成功！"
+              exit 0
+            fi
+            echo "⚠️ 该节点连接失败，尝试下一个备用节点..."
+          done <<< "$NODE_LINK"
+          echo "❌ 所有备用节点均连接失败"
+          exit 1
+        else
+          echo "[INFO] 未配置代理，直连模式"
+          echo "IS_PROXY=false" >> $GITHUB_ENV
+        fi
 
     - name: 🚀 运行续期脚本
       env:
