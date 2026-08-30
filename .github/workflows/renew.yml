@@ -37,6 +37,7 @@ jobs:
       env:
         KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
         KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
+        KATABUMP_ACCOUNTS: ${{ secrets.KATABUMP_ACCOUNTS }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
